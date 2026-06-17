@@ -1,0 +1,48 @@
+﻿# Local Vector DB Report
+
+## Summary
+- Status: usable
+- Input file: `final_rag_chunks.csv`
+- Output directory: `vector_db_check`
+- Embedding method: `local_hash_tfidf_char_word_v1`
+- Similarity: cosine
+- Vector dimension: 4096
+- Vector count: 445
+- Metadata rows: 445
+
+## Output Files
+- `vectors.npz`
+- `metadata.csv`
+- `metadata.jsonl`
+- `manifest.json`
+- `vector_db_report.md`
+
+## Quality Checks
+- Duplicate chunk_id rows: 0
+- Empty content rows: 0
+- Replacement character rows: 0
+- needs_review rows: 0
+
+## Source Group Counts
+- curriculum_2021_2025: 413
+- department_web: 32
+
+## Category Counts
+- 개정이력: 2
+- 교양과정: 6
+- 교육과정-과목표: 217
+- 교육과정-교과목개요: 151
+- 교육과정-로드맵: 9
+- 교육과정-역량매트릭스: 1
+- 교육목표: 6
+- 선후수규칙: 1
+- 역량: 5
+- 입학Q&A: 15
+- 입학정보: 14
+- 졸업요건: 10
+- 진로및자격증: 2
+- 학과소개: 6
+
+## Note
+This is a local reproducible vector index built without external model downloads.
+For production semantic retrieval, the same `final_rag_chunks.csv` can later be embedded with OpenAI, SentenceTransformers, Chroma, FAISS, or Supabase Vector.

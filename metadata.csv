@@ -1,0 +1,3 @@
+﻿method,total,pass,review,fail,pass_rate,avg_checkpoint_ratio,avg_source_ratio,zero_checkpoint_rows,zero_source_rows
+No RAG,188,23,68,97,12.23,45.07,0.0,35,188
+RAG,188,188,0,0,100.0,100.0,100.0,0,0

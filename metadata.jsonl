@@ -1,0 +1,14 @@
+{
+  "embedding_method": "local_hash_tfidf_char_word_v1",
+  "similarity": "cosine",
+  "dimension": 4096,
+  "vector_count": 445,
+  "metadata_rows": 445,
+  "input_file": "data\\final_rag\\final_rag_chunks.csv",
+  "files": {
+    "vectors": "vectors.npz",
+    "metadata_csv": "metadata.csv",
+    "metadata_jsonl": "metadata.jsonl",
+    "report": "vector_db_report.md"
+  }
+}
