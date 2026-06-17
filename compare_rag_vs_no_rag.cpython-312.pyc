@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ANSWERS = ROOT / "work" / "answer_quality" / "generated_answers_postprocessed.csv"
+DEFAULT_OUT_DIR = ROOT / "work" / "answer_quality_evaluation"
+
+
+def read_csv_auto(path: Path) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(path, encoding=encoding, dtype=str).fillna("")
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, dtype=str).fillna("")
+
+
+def split_values(value: object) -> list[str]:
+    return [part.strip() for part in re.split(r"[;,]", str(value or "")) if part.strip()]
+
+
+def normalize_text(value: object) -> str:
+    text = str(value or "").lower()
+    replacements = {
+        "Ⅰ": "i",
+        "Ⅱ": "ii",
+        "Ⅲ": "iii",
+        "Ⅳ": "iv",
+        "|": "i",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "_": "",
+        "-": "",
+        " ": "",
+    }
+    for before, after in replacements.items():
+        text = text.replace(before, after)
+    text = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+    return text
+
+
+def checkpoint_score(check_points: str, answer: str) -> tuple[int, int, str, str]:
+    points = split_values(check_points)
+    answer_norm = normalize_text(answer)
+
+    hits: list[str] = []
+    misses: list[str] = []
+    for point in points:
+        point_norm = normalize_text(point)
+        if not point_norm:
+            continue
+        if point_norm in answer_norm:
+            hits.append(point)
+            continue
+
+        # 긴 한국어 문장은 핵심 조각 대부분이 포함되어 있으면 통과로 본다.
+        fragments = [
+            normalize_text(part)
+            for part in re.split(r"[\s/·,()]+", point)
+            if len(normalize_text(part)) >= 2
+        ]
+        if fragments:
+            matched = sum(1 for fragment in fragments if fragment in answer_norm)
+            needed = max(1, min(len(fragments), round(len(fragments) * 0.7)))
+            if matched >= needed:
+                hits.append(point)
+                continue
+        misses.append(point)
+
+    total = len(hits) + len(misses)
+    return len(hits), total, "; ".join(hits), "; ".join(misses)
+
+
+def source_score(expected_source: str, answer: str) -> tuple[int, int, str, str]:
+    sources = split_values(expected_source)
+    answer_norm = normalize_text(answer)
+    hits: list[str] = []
+    misses: list[str] = []
+    for source in sources:
+        if normalize_text(source) in answer_norm:
+            hits.append(source)
+        else:
+            misses.append(source)
+    total = len(hits) + len(misses)
+    return len(hits), total, "; ".join(hits), "; ".join(misses)
+
+
+def evaluate(
+    answers_path: Path,
+    answer_column: str,
+    require_source_mention: bool = False,
+    skip_empty: bool = False,
+) -> pd.DataFrame:
+    data = read_csv_auto(answers_path)
+    if answer_column not in data.columns:
+        raise ValueError(f"Answer column '{answer_column}' does not exist in {answers_path}.")
+    if skip_empty:
+        data = data[data[answer_column].astype(str).str.strip().ne("")].copy()
+
+    rows: list[dict[str, object]] = []
+    for index, row in data.iterrows():
+        answer = str(row.get(answer_column, ""))
+        cp_hits, cp_total, cp_hit_terms, cp_missing_terms = checkpoint_score(row.get("check_points", ""), answer)
+        source_hits, source_total, source_hit_terms, source_missing_terms = source_score(row.get("expected_source", ""), answer)
+        cp_ratio = cp_hits / cp_total if cp_total else 1.0
+        source_ratio = source_hits / source_total if source_total else 1.0
+
+        has_required_source = source_ratio > 0 if require_source_mention else True
+        if cp_ratio >= 0.8 and has_required_source:
+            status = "pass"
+        elif cp_ratio >= 0.5:
+            status = "review"
+        else:
+            status = "fail"
+
+        rows.append(
+            {
+                "question_id": row.get("question_id", f"row_{index + 1:03d}"),
+                "qa_group": row.get("qa_group", ""),
+                "year": row.get("year", ""),
+                "question": row.get("question", ""),
+                "answer_column": answer_column,
+                "checkpoint_hits": cp_hits,
+                "checkpoint_total": cp_total,
+                "checkpoint_ratio": round(cp_ratio, 4),
+                "checkpoint_hit_terms": cp_hit_terms,
+                "checkpoint_missing_terms": cp_missing_terms,
+                "source_hits": source_hits,
+                "source_total": source_total,
+                "source_ratio": round(source_ratio, 4),
+                "source_hit_terms": source_hit_terms,
+                "source_missing_terms": source_missing_terms,
+                "require_source_mention": require_source_mention,
+                "status": status,
+                "answer": answer,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_report(
+    results: pd.DataFrame,
+    answers_path: Path,
+    answer_column: str,
+    require_source_mention: bool,
+    skip_empty: bool,
+) -> str:
+    total = len(results)
+    status_counts = results["status"].value_counts().to_dict()
+    pass_count = int(status_counts.get("pass", 0))
+    review_count = int(status_counts.get("review", 0))
+    fail_count = int(status_counts.get("fail", 0))
+    avg_checkpoint = float(results["checkpoint_ratio"].mean()) if total else 0.0
+    avg_source = float(results["source_ratio"].mean()) if total else 0.0
+
+    lines = [
+        "# Answer Quality Evaluation Report",
+        "",
+        f"- Answers file: `{answers_path}`",
+        f"- Answer column: `{answer_column}`",
+        f"- Require source mention for PASS: {require_source_mention}",
+        f"- Skip empty answers: {skip_empty}",
+        f"- Total questions: {total}",
+        "",
+        "## Summary",
+        "",
+        f"- PASS: {pass_count}",
+        f"- REVIEW: {review_count}",
+        f"- FAIL: {fail_count}",
+        f"- average_checkpoint_ratio: {avg_checkpoint:.1%}",
+        f"- average_source_ratio: {avg_source:.1%}",
+        "",
+        "## Failures",
+        "",
+    ]
+
+    failures = results[results["status"].eq("fail")]
+    if failures.empty:
+        lines.append("- No answer-quality failures.")
+    else:
+        for _, row in failures.head(50).iterrows():
+            lines.append(
+                f"- `{row['question_id']}` checkpoint {row['checkpoint_hits']}/{row['checkpoint_total']}: "
+                f"{row['question']}"
+            )
+
+    lines.extend(["", "## Review Needed", ""])
+    reviews = results[results["status"].eq("review")]
+    if reviews.empty:
+        lines.append("- No review rows.")
+    else:
+        for _, row in reviews.head(50).iterrows():
+            lines.append(
+                f"- `{row['question_id']}` checkpoint {row['checkpoint_hits']}/{row['checkpoint_total']}: "
+                f"{row['question']}"
+            )
+
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate generated RAG answers against QA checkpoints.")
+    parser.add_argument("--answers", type=Path, default=DEFAULT_ANSWERS)
+    parser.add_argument("--answer-column", default="generated_answer")
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--require-source-mention",
+        action="store_true",
+        help="Require the expected source filename to appear in the answer for PASS.",
+    )
+    parser.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help="Evaluate only rows where the answer column is not empty.",
+    )
+    args = parser.parse_args()
+
+    results = evaluate(args.answers, args.answer_column, args.require_source_mention, args.skip_empty)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = args.out_dir / f"answer_quality_results_{args.answer_column}.csv"
+    md_path = args.out_dir / f"answer_quality_report_{args.answer_column}.md"
+    results.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    md_path.write_text(
+        build_report(results, args.answers, args.answer_column, args.require_source_mention, args.skip_empty),
+        encoding="utf-8-sig",
+        newline="\n",
+    )
+
+    total = len(results)
+    print(f"Saved CSV: {csv_path}")
+    print(f"Saved report: {md_path}")
+    print(f"Total: {total}")
+    if total:
+        print(f"PASS: {int(results['status'].eq('pass').sum())}")
+        print(f"REVIEW: {int(results['status'].eq('review').sum())}")
+        print(f"FAIL: {int(results['status'].eq('fail').sum())}")
+        print(f"average_checkpoint_ratio: {results['checkpoint_ratio'].mean():.1%}")
+        print(f"average_source_ratio: {results['source_ratio'].mean():.1%}")
+
+
+if __name__ == "__main__":
+    main()

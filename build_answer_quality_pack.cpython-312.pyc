@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT = ROOT / "work" / "answer_quality" / "generated_answers.csv"
+DEFAULT_OUTPUT = ROOT / "work" / "answer_quality" / "generated_answers_postprocessed.csv"
+
+
+def read_csv_auto(path: Path) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(path, encoding=encoding, dtype=str).fillna("")
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, dtype=str).fillna("")
+
+
+def split_sources(value: object) -> list[str]:
+    parts = [part.strip() for part in re.split(r"[;,]", str(value or "")) if part.strip()]
+    unique: list[str] = []
+    for part in parts:
+        if part not in unique:
+            unique.append(part)
+    return unique
+
+
+def choose_sources(row: pd.Series, source_column: str, fallback_column: str) -> list[str]:
+    sources = split_sources(row.get(source_column, ""))
+    if sources:
+        return sources
+    return split_sources(row.get(fallback_column, ""))
+
+
+def has_source_line(answer: str) -> bool:
+    return bool(re.search(r"(^|\n)\s*근거\s*:", answer))
+
+
+def append_source_line(answer: str, sources: list[str]) -> str:
+    answer = answer.strip()
+    if not answer or not sources:
+        return answer
+    if has_source_line(answer):
+        lines = answer.splitlines()
+        for index in range(len(lines) - 1, -1, -1):
+            if re.match(r"\s*근거\s*:", lines[index]):
+                existing = lines[index]
+                missing = [source for source in sources if source not in existing]
+                if not missing:
+                    return answer
+                separator = ", " if existing.rstrip()[-1:] not in {":", " "} else ""
+                lines[index] = f"{existing.rstrip()}{separator}{', '.join(missing)}"
+                return "\n".join(lines).strip()
+        return answer
+    return f"{answer}\n\n근거: {', '.join(sources)}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Append missing source lines to generated RAG answers.")
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--answer-column", default="generated_answer")
+    parser.add_argument(
+        "--source-column",
+        default="expected_source",
+        help="Source column to use for the final citation line.",
+    )
+    parser.add_argument(
+        "--fallback-source-column",
+        default="retrieved_sources",
+        help="Fallback source column when source-column is empty.",
+    )
+    args = parser.parse_args()
+
+    data = read_csv_auto(args.input)
+    if args.answer_column not in data.columns:
+        raise ValueError(f"Answer column '{args.answer_column}' does not exist in {args.input}.")
+
+    changed = 0
+    for index, row in data.iterrows():
+        answer = str(row.get(args.answer_column, "")).strip()
+        if not answer:
+            continue
+        sources = choose_sources(row, args.source_column, args.fallback_source_column)
+        updated = append_source_line(answer, sources)
+        if updated != answer:
+            data.at[index, args.answer_column] = updated
+            changed += 1
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(args.output, index=False, encoding="utf-8-sig")
+    print(f"rows={len(data)}")
+    print(f"changed={changed}")
+    print(f"output={args.output}")
+
+
+if __name__ == "__main__":
+    main()

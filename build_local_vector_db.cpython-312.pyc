@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS_DIR = ROOT / "tools"
+DEFAULT_DB = ROOT / "data" / "vector_db"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+sys.path.insert(0, str(TOOLS_DIR))
+from search_local_vector_db import classify_query_intent, rank_indices  # noqa: E402
+
+
+def shorten(text: object, max_length: int = 900) -> str:
+    value = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3].rstrip() + "..."
+
+
+class LocalRagIndex:
+    def __init__(self, db_dir: Path) -> None:
+        self.db_dir = db_dir
+        vectors_file = np.load(db_dir / "vectors.npz")
+        self.vectors = vectors_file["vectors"]
+        self.idf = vectors_file["idf"]
+        self.dimension = int(vectors_file["dimension"][0])
+        self.metadata = pd.read_csv(db_dir / "metadata.csv", encoding="utf-8-sig", dtype=str).fillna("")
+
+    def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        top_indices, scores = rank_indices(
+            self.vectors,
+            self.idf,
+            self.dimension,
+            self.metadata,
+            query,
+            top_k,
+        )
+        intent = classify_query_intent(query).get("intent", "general")
+        results: list[dict[str, Any]] = []
+        for rank, index in enumerate(top_indices, 1):
+            row = self.metadata.iloc[int(index)].to_dict()
+            results.append(
+                {
+                    "rank": rank,
+                    "score": round(float(scores[int(index)]), 4),
+                    "intent": intent,
+                    "chunk_id": row.get("chunk_id", ""),
+                    "doc_id": row.get("doc_id", ""),
+                    "title": row.get("title", ""),
+                    "category": row.get("category", ""),
+                    "section": row.get("section", ""),
+                    "source_file": row.get("source_file", ""),
+                    "source_group": row.get("source_group", ""),
+                    "year": row.get("year", ""),
+                    "url": row.get("url", ""),
+                    "content": row.get("content", ""),
+                    "snippet": shorten(row.get("content", ""), 260),
+                }
+            )
+        return results
+
+
+def build_context(results: list[dict[str, Any]], max_chars: int = 5200) -> str:
+    blocks: list[str] = []
+    total = 0
+    for result in results:
+        block = (
+            f"[근거 {result['rank']}]\n"
+            f"- 제목: {result.get('title', '')}\n"
+            f"- 범주: {result.get('category', '')}\n"
+            f"- 출처 파일: {result.get('source_file', '')}\n"
+            f"- 연도: {result.get('year', '')}\n"
+            f"- 내용: {shorten(result.get('content', ''), 1200)}"
+        )
+        if total + len(block) > max_chars:
+            break
+        blocks.append(block)
+        total += len(block)
+    return "\n\n".join(blocks)
+
+
+def build_local_answer(question: str, results: list[dict[str, Any]]) -> str:
+    if not results:
+        return "질문과 관련된 RAG 문서를 찾지 못했습니다. 연도, 과목명, 졸업요건, 진로, 입학처럼 질문 범위를 조금 더 구체적으로 적어 주세요."
+
+    best = results[0]
+    content = shorten(best.get("content", ""), 760)
+    if not content:
+        return "검색된 문서는 있지만 답변에 사용할 본문 내용이 비어 있습니다. 질문을 조금 더 구체적으로 다시 입력해 주세요."
+    return f"{content}\n\n필요하면 아래의 출처 버튼을 눌러 사용한 문서와 범주를 확인할 수 있습니다."
+
+
+def call_gemini(
+    question: str,
+    results: list[dict[str, Any]],
+    model: str,
+    api_url: str,
+    api_key: str,
+    timeout: int = 60,
+) -> str:
+    context = build_context(results)
+    source_files = ", ".join(
+        dict.fromkeys(str(result.get("source_file", "")).strip() for result in results if result.get("source_file"))
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "너는 건양대학교 인공지능학과 RAG 챗봇이다. "
+                "반드시 제공된 근거 문서 안에서만 답한다. "
+                "근거에 없는 내용은 추측하지 말고 '제공된 자료에서는 확인되지 않습니다'라고 말한다. "
+                "답변은 한국어로 간결하게 작성한다. "
+                "답변 본문에는 출처 파일명이나 '근거:' 문구를 쓰지 않는다. "
+                "출처 정보는 별도의 sources 필드와 앱의 출처 버튼으로 표시된다."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"질문: {question}\n\n"
+                f"검색된 근거:\n{context}\n\n"
+                f"출처 후보: {source_files}\n\n"
+                "위 근거만 사용해서 답변해줘. 출처 파일명은 답변 본문에 쓰지 마."
+            ),
+        },
+    ]
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 1200,
+        "temperature": 0.2,
+    }
+    request = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini API HTTP {exc.code}: {error_body}") from exc
+
+    try:
+        return str(body["choices"][0]["message"]["content"]).strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected Gemini API response: {body}") from exc
+
+
+class RagApiHandler(BaseHTTPRequestHandler):
+    index: LocalRagIndex
+    model: str
+    api_url: str
+    api_key_env: str
+
+    def log_message(self, format: str, *args: object) -> None:
+        print(f"{self.address_string()} - {format % args}")
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self._send_json(200, {"ok": True})
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/health"):
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "documents": int(len(self.index.metadata)),
+                    "model": self.model,
+                    "api_key_env": self.api_key_env,
+                    "llm_ready": bool(os.environ.get(self.api_key_env)),
+                },
+            )
+            return
+        self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self) -> None:
+        if not self.path.startswith("/ask"):
+            self._send_json(404, {"error": "Not found"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode("utf-8")
+            payload = json.loads(body or "{}")
+            question = str(payload.get("question", "")).strip()
+            top_k = int(payload.get("top_k", 5) or 5)
+            use_llm = bool(payload.get("use_llm", True))
+            model = str(payload.get("model", self.model) or self.model)
+        except Exception as exc:
+            self._send_json(400, {"error": f"Invalid request: {exc}"})
+            return
+
+        if not question:
+            self._send_json(400, {"error": "question is required"})
+            return
+
+        results = self.index.search(question, top_k=max(1, min(top_k, 10)))
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        mode = "local_fallback"
+        error = ""
+
+        if use_llm and api_key:
+            try:
+                answer = call_gemini(question, results, model, self.api_url, api_key)
+                mode = "gemini"
+            except Exception as exc:
+                error = str(exc)
+                answer = build_local_answer(question, results)
+        else:
+            answer = build_local_answer(question, results)
+            if use_llm and not api_key:
+                error = f"{self.api_key_env} is not set."
+
+        self._send_json(
+            200,
+            {
+                "question": question,
+                "answer": answer,
+                "sources": results,
+                "mode": mode,
+                "model": model if mode == "gemini" else "",
+                "error": error,
+            },
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run a local RAG API server for the Flutter app.")
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--api-url", default=DEFAULT_API_URL)
+    parser.add_argument("--api-key-env", default="GEMINI_API_KEY")
+    args = parser.parse_args()
+
+    RagApiHandler.index = LocalRagIndex(args.db)
+    RagApiHandler.model = args.model
+    RagApiHandler.api_url = args.api_url
+    RagApiHandler.api_key_env = args.api_key_env
+
+    server = ThreadingHTTPServer((args.host, args.port), RagApiHandler)
+    print(f"RAG API server running: http://{args.host}:{args.port}")
+    print(f"Vector DB: {args.db}")
+    print(f"LLM ready: {bool(os.environ.get(args.api_key_env))} ({args.api_key_env})")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

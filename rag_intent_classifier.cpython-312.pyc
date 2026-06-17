@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_QA = ROOT / "data" / "evaluation" / "question_answer_all_eval_ready.csv"
+DEFAULT_DB = ROOT / "data" / "vector_db"
+DEFAULT_OUT_DIR = ROOT / "work" / "retrieval_evaluation"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from search_local_vector_db import rank_indices  # noqa: E402
+
+
+def read_csv_auto(path: Path) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(path, encoding=encoding, dtype=str).fillna("")
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, dtype=str).fillna("")
+
+
+def split_values(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[;,]", str(value or "")) if part.strip()]
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "").lower())
+
+
+def clean_checkpoint(point: str) -> str:
+    point = str(point or "").strip()
+    point = re.sub(r"\s+", " ", point)
+    return point
+
+
+def should_skip_checkpoint(point: str) -> bool:
+    negative_markers = (
+        "없음",
+        "자료에 없음",
+        "근거 없음",
+        "확인 불가",
+        "판단 불가",
+        "별도 확인",
+        "필요",
+    )
+    return any(marker in point for marker in negative_markers)
+
+
+def checkpoint_hits(check_points: str, searched_text: str) -> tuple[int, int, str, str]:
+    points = [clean_checkpoint(point) for point in split_values(check_points)]
+    points = [point for point in points if point and not should_skip_checkpoint(point)]
+    searched_norm = normalize_text(searched_text)
+
+    hits: list[str] = []
+    misses: list[str] = []
+    for point in points:
+        if normalize_text(point) in searched_norm:
+            hits.append(point)
+        else:
+            misses.append(point)
+    return len(hits), len(points), "; ".join(hits), "; ".join(misses)
+
+
+def load_vector_db(db_dir: Path) -> tuple[np.ndarray, np.ndarray, int, pd.DataFrame]:
+    vectors_file = np.load(db_dir / "vectors.npz")
+    vectors = vectors_file["vectors"]
+    idf = vectors_file["idf"]
+    dimension = int(vectors_file["dimension"][0])
+    metadata = read_csv_auto(db_dir / "metadata.csv")
+    return vectors, idf, dimension, metadata
+
+
+def search_loaded(
+    vectors: np.ndarray,
+    idf: np.ndarray,
+    dimension: int,
+    metadata: pd.DataFrame,
+    query: str,
+    top_k: int,
+) -> list[dict[str, object]]:
+    top_indices, scores = rank_indices(vectors, idf, dimension, metadata, query, top_k)
+
+    results: list[dict[str, object]] = []
+    for rank, index in enumerate(top_indices, 1):
+        row = metadata.iloc[int(index)].to_dict()
+        row["rank"] = rank
+        row["score"] = float(scores[int(index)])
+        results.append(row)
+    return results
+
+
+def source_hit(results: list[dict[str, object]], expected_sources: list[str], k: int) -> bool:
+    top_sources = {str(result.get("source_file", "")).strip() for result in results[:k]}
+    return bool(top_sources.intersection(expected_sources))
+
+
+def evaluate(qa_path: Path, db_dir: Path, top_k: int) -> pd.DataFrame:
+    qa = read_csv_auto(qa_path)
+    vectors, idf, dimension, metadata = load_vector_db(db_dir)
+
+    rows: list[dict[str, object]] = []
+    for index, qa_row in qa.iterrows():
+        question = str(qa_row["question"])
+        expected_sources = split_values(str(qa_row["expected_source"]))
+        results = search_loaded(vectors, idf, dimension, metadata, question, top_k)
+
+        searched_text = " ".join(
+            " ".join(
+                str(result.get(col, ""))
+                for col in ("title", "category", "section", "content", "source_file")
+            )
+            for result in results
+        )
+        cp_hits, cp_total, cp_hit_terms, cp_missing_terms = checkpoint_hits(
+            str(qa_row.get("check_points", "")),
+            searched_text,
+        )
+        cp_ratio = cp_hits / cp_total if cp_total else 1.0
+
+        hit_at_1 = source_hit(results, expected_sources, 1)
+        hit_at_3 = source_hit(results, expected_sources, min(3, top_k))
+        hit_at_5 = source_hit(results, expected_sources, min(5, top_k))
+
+        if not hit_at_5:
+            status = "fail"
+        elif cp_ratio >= 0.4:
+            status = "pass"
+        else:
+            status = "review"
+
+        top_sources = [str(result.get("source_file", "")).strip() for result in results]
+        top_ids = [str(result.get("chunk_id", "")).strip() for result in results]
+        top_titles = [str(result.get("title", "")).strip() for result in results]
+        top_scores = [f"{float(result.get('score', 0.0)):.4f}" for result in results]
+
+        rows.append(
+            {
+                "question_id": qa_row.get("question_id", f"row_{index + 1:03d}"),
+                "qa_group": qa_row.get("qa_group", ""),
+                "year": qa_row.get("year", ""),
+                "question": question,
+                "expected_source": ";".join(expected_sources),
+                "top1_source": top_sources[0] if top_sources else "",
+                "top1_chunk_id": top_ids[0] if top_ids else "",
+                "top1_title": top_titles[0] if top_titles else "",
+                "top1_score": top_scores[0] if top_scores else "",
+                "source_hit_at_1": hit_at_1,
+                "source_hit_at_3": hit_at_3,
+                "source_hit_at_5": hit_at_5,
+                "checkpoint_hits": cp_hits,
+                "checkpoint_total": cp_total,
+                "checkpoint_ratio": round(cp_ratio, 4),
+                "checkpoint_hit_terms": cp_hit_terms,
+                "checkpoint_missing_terms": cp_missing_terms,
+                "status": status,
+                "top5_sources": ";".join(top_sources),
+                "top5_chunk_ids": ";".join(top_ids),
+                "top5_titles": " || ".join(top_titles),
+                "top5_scores": ";".join(top_scores),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_report(results: pd.DataFrame, qa_path: Path, db_dir: Path, top_k: int) -> str:
+    total = len(results)
+    status_counts = results["status"].value_counts().to_dict()
+    hit1 = int(results["source_hit_at_1"].sum())
+    hit3 = int(results["source_hit_at_3"].sum())
+    hit5 = int(results["source_hit_at_5"].sum())
+    avg_cp = float(results["checkpoint_ratio"].mean()) if total else 0.0
+
+    lines = [
+        "# Retrieval Evaluation Report",
+        "",
+        f"- QA file: `{qa_path}`",
+        f"- Vector DB: `{db_dir}`",
+        f"- Total questions: {total}",
+        f"- Top K: {top_k}",
+        "",
+        "## Summary",
+        "",
+        f"- PASS: {status_counts.get('pass', 0)}",
+        f"- REVIEW: {status_counts.get('review', 0)}",
+        f"- FAIL: {status_counts.get('fail', 0)}",
+        f"- source_hit@1: {hit1}/{total} ({hit1 / total:.1%})" if total else "- source_hit@1: 0/0",
+        f"- source_hit@3: {hit3}/{total} ({hit3 / total:.1%})" if total else "- source_hit@3: 0/0",
+        f"- source_hit@5: {hit5}/{total} ({hit5 / total:.1%})" if total else "- source_hit@5: 0/0",
+        f"- average_checkpoint_ratio: {avg_cp:.1%}",
+        "",
+        "## Failures",
+        "",
+    ]
+
+    failures = results[results["status"].eq("fail")]
+    if failures.empty:
+        lines.append("- No source_hit@5 failures.")
+    else:
+        for _, row in failures.iterrows():
+            lines.append(
+                f"- `{row['question_id']}` expected `{row['expected_source']}`, "
+                f"top1 `{row['top1_source']}`: {row['question']}"
+            )
+
+    lines.extend(["", "## Review Needed", ""])
+    reviews = results[results["status"].eq("review")]
+    if reviews.empty:
+        lines.append("- No review rows.")
+    else:
+        for _, row in reviews.iterrows():
+            lines.append(
+                f"- `{row['question_id']}` checkpoint {row['checkpoint_hits']}/{row['checkpoint_total']}, "
+                f"top1 `{row['top1_source']}`: {row['question']}"
+            )
+
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate retrieval quality for the local RAG vector DB.")
+    parser.add_argument("--qa", type=Path, default=DEFAULT_QA, help="QA CSV with question/expected_source/check_points.")
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Local vector DB directory.")
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="Output directory for CSV/MD report.")
+    parser.add_argument("--top-k", type=int, default=5)
+    args = parser.parse_args()
+
+    results = evaluate(args.qa, args.db, args.top_k)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = args.out_dir / "retrieval_evaluation_results.csv"
+    md_path = args.out_dir / "retrieval_evaluation_report.md"
+    results.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    md_path.write_text(build_report(results, args.qa, args.db, args.top_k), encoding="utf-8-sig")
+
+    total = len(results)
+    status_counts = results["status"].value_counts().to_dict()
+    print(f"Saved CSV: {csv_path}")
+    print(f"Saved report: {md_path}")
+    print(f"Total: {total}")
+    print(f"PASS: {status_counts.get('pass', 0)}")
+    print(f"REVIEW: {status_counts.get('review', 0)}")
+    print(f"FAIL: {status_counts.get('fail', 0)}")
+    if total:
+        print(f"source_hit@5: {int(results['source_hit_at_5'].sum())}/{total} ({results['source_hit_at_5'].mean():.1%})")
+
+
+if __name__ == "__main__":
+    main()

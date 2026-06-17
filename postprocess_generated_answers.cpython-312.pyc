@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT = ROOT / "work" / "answer_quality" / "answer_prompt_dataset.csv"
+DEFAULT_OUTPUT = ROOT / "work" / "no_rag" / "no_rag_prompt_dataset.csv"
+
+
+def read_csv_auto(path: Path) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(path, encoding=encoding, dtype=str).fillna("")
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, dtype=str).fillna("")
+
+
+def build_user_prompt(question: str, year: str) -> str:
+    year_hint = "" if not str(year).strip() or str(year).strip() == "공통" else f"\n질문 연도: {year}"
+    return (
+        f"질문: {question}{year_hint}\n\n"
+        "검색된 학과 문서나 RAG 근거는 제공되지 않습니다. "
+        "일반적인 지식만으로 답하되, 확실하지 않은 학과 세부 정보는 추측하지 말고 "
+        "'제공된 자료 없이는 확인하기 어렵습니다'라고 말하세요."
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build no-RAG answer generation prompt dataset.")
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+
+    data = read_csv_auto(args.input)
+    required = {"question_id", "question", "expected_source", "expected_answer", "check_points"}
+    missing = sorted(required - set(data.columns))
+    if missing:
+        raise ValueError(f"Input file is missing required columns: {missing}")
+
+    data["answer_intent"] = "no_rag_baseline"
+    data["context_top_k"] = "0"
+    data["system_prompt"] = (
+        "너는 일반 AI 챗봇이다. 건양대학교 인공지능학과의 내부 RAG 문서, 교육과정 PDF, "
+        "크롤링 문서, 벡터 DB 검색 결과를 제공받지 않은 상태에서 답한다. "
+        "근거 파일명이나 출처를 임의로 만들어내지 않는다. "
+        "정확히 모르는 학교 세부 정보는 모른다고 답한다."
+    )
+    data["user_prompt"] = data.apply(
+        lambda row: build_user_prompt(str(row.get("question", "")), str(row.get("year", ""))),
+        axis=1,
+    )
+    data["retrieved_context"] = ""
+    data["retrieved_sources"] = ""
+    data["retrieved_chunk_ids"] = ""
+    data["top1_source"] = ""
+    data["top1_title"] = ""
+    data["source_hit_at_1"] = "FALSE"
+    data["source_hit_at_5"] = "FALSE"
+    data["generated_answer"] = ""
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(args.output, index=False, encoding="utf-8-sig")
+    print(f"rows={len(data)}")
+    print(f"output={args.output}")
+
+
+if __name__ == "__main__":
+    main()
